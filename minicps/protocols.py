@@ -24,8 +24,7 @@ import sys
 import shlex
 import subprocess
 
-import cpppo
-import pymodbus
+import minicps.bacnet.server as bacnet_server
 
 
 # Protocol {{{1
@@ -818,3 +817,206 @@ class ModbusProtocol(Protocol):
             print 'ERROR modbus _receive: ', error
 
 # }}}
+
+class BACnetProtocol(Protocol):
+
+    """BACnet protocol manager.
+
+    name: bacnet
+
+    Tag is a list of dicts with the following keys:
+    type - (str) BACpypes object name.
+    index - (int) index of the object
+    name - (str) object name
+    description - (str) (optional) object description
+
+    Supported modes:
+        - The mode is ignored. A server device must always be created.
+
+    """
+
+    # server ports
+    _UDP_PORT = '47808'
+    _UDP_SUBNET = '24'
+
+    def __init__(self, protocol):
+        protocol["mode"] = 1
+
+        super(BACnetProtocol, self).__init__(protocol)
+
+        if sys.platform.startswith('linux'):
+            self._client_log = 'logs/bacnet_client '
+        else:
+            raise OSError
+
+        self._server_log = 'logs/modbus_tcp_server '
+
+        ip_address, subnet, port = BACnetProtocol._clean_address(self._server['address'])
+
+        self._server['address'] = ip_address + '/' + subnet + ":" + port
+
+        self.ip_address = ip_address
+
+        self._application = None
+
+        self._start_server(
+            address=self._server.get('address', "127.0.0.1"),
+            tags=self._server.get('tags', []),
+            device_name=self._server.get('name', 'Test BACnet'),
+            device_id=self._server.get('device_id', 500)
+        )
+
+    @staticmethod
+    def _clean_address(address):
+        address_parts = address.split(":")
+
+        if len(address_parts) == 2:
+            port = address_parts[1]
+            if port != BACnetProtocol._UDP_PORT:
+                print 'WARNING: not using std BACnet %s UDP port' % \
+                      BACnetProtocol._UDP_PORT
+        else:
+            port = BACnetProtocol._UDP_PORT
+
+        address_parts = address_parts[0].split("/")
+
+        ip_address = address_parts[0]
+
+        if len(address_parts) == 2:
+            subnet = address_parts[1]
+        else:
+            subnet = BACnetProtocol._UDP_SUBNET
+
+        return ip_address, subnet, port
+
+    def _is_running(self):
+        return self._application is not None and self._application.is_running()
+
+    def _start_server(self, address='localhost:47808', device_name="", device_id=501, tags=[]):
+        """Start a bacpypes bacnet server.
+        :returns: the BACpypes application object
+        """
+
+        if self._is_running():
+            print "Stopping old server"
+            self._stop_server()
+
+        self._self_address = address
+
+        try:
+            self._application = bacnet_server.create_application(address, device_name, device_id, tags)
+
+            self._application.start_application()
+        except Exception as error:
+            print 'ERROR bacnet _start_server: ', repr(error)
+
+    def _stop_server(self):
+        """Stop a bacnet server.
+        """
+
+        try:
+            # Tell bacpypes to stop the application and wait for the thread to terminate.
+            self._application.stop_application()
+            self._application.server_thread.join(timeout=10)
+            if self._application.server_thread.is_alive():
+                print "BACnet server did not close properly!"
+            else:
+                self._application = None
+        except Exception as error:
+            print 'ERROR stop bacnet server: ', repr(error)
+
+    def _cast_value(self, value, datatype):
+        if datatype is bacnet_server.Integer:
+            value = int(value)
+        elif datatype is bacnet_server.Real:
+            value = float(value)
+        elif datatype is bacnet_server.Unsigned:
+            value = int(value)
+        return datatype(value)
+
+
+    def _send(self, what, value, address=None, **kwargs):
+        """Send (write) a value to another host.
+
+        It is a blocking operation
+
+        :what: (dict) what to change
+            - type - (string) bacpypes type name of the object
+            - instance - (int) index of the object
+            - property - (str) bacpypes name of property
+            - index - (int) (optional) array index for array type properties
+            - priority - (int) (optional) specify position in the priority array
+                         to write to. (Affects some presentValue properties)
+        :value: sent
+        :address: target address
+        """
+
+        if address is None:
+            address = self.ip_address
+
+        request_self = address.startswith(self.ip_address)
+
+        request = bacnet_server.WritePropertyRequest(
+            objectIdentifier=(what["type"], what["instance"]),
+            propertyIdentifier=what["property"])
+
+        datatype = bacnet_server.get_datatype(what["type"], what["property"])
+        if (value is None or value == 'null'):
+            bac_value = bacnet_server.Null()
+        elif issubclass(datatype, bacnet_server.Atomic):
+            bac_value = self._cast_value(value, datatype)
+        elif issubclass(datatype, bacnet_server.Array) and ("index" in what):
+            if what["index"] == 0:
+                bac_value = bacnet_server.Integer(value)
+            elif issubclass(datatype.subtype, bacnet_server.Atomic):
+                bac_value = datatype.subtype(value)
+            elif not isinstance(value, datatype.subtype):
+                raise TypeError("invalid result datatype, expecting {}".format(
+                    datatype.subtype.__name__,))
+        elif not isinstance(value, datatype):
+            raise TypeError("invalid result datatype, expecting %s".format(
+                datatype.__name__,))
+
+        request.propertyValue = bacnet_server.Any()
+        request.propertyValue.cast_in(bac_value)
+
+        request.pduDestination = bacnet_server.Address(address)
+
+        # Optional index
+        if "index" in what:
+            request.propertyArrayIndex = what["index"]
+
+        # Optional priority
+        if "priority" in what:
+            request.priority = what["priority"]
+
+        iocb = bacnet_server.IOCB(request=request, request_self=request_self)
+        self._application.submit_request(iocb)
+        iocb.get(10)
+
+    def _receive(self, what, address=None, **kwargs):
+        """Receive (read) a value from another host.
+
+        :what: (dict) to ask for
+            - type - (string) bacpypes type name of the object
+            - instance - (int) index of the object
+            - property - (str) bacpypes name of property
+            - index - (int) (optional) array index for array type properties
+        :address: ip[:port], not validated
+
+        :returns: read value(s)
+        """
+        if address is None:
+            address = self.ip_address
+
+        request_self = address.startswith(self.ip_address)
+
+        request = bacnet_server.ReadPropertyRequest(
+            objectIdentifier=(what["type"], what["instance"]),
+            propertyIdentifier=what["property"],
+            propertyArrayIndex=what.get("index"))
+        request.pduDestination = bacnet_server.Address(address)
+        iocb = bacnet_server.IOCB(request=request, request_self=request_self)
+        self._application.submit_request(iocb)
+        return iocb.get(10)
+

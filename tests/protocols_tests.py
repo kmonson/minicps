@@ -10,11 +10,12 @@ import subprocess
 import sys
 import shlex
 import time
+from copy import deepcopy
 
 import pymodbus
 import cpppo
 
-from minicps.protocols import Protocol, EnipProtocol, ModbusProtocol
+from minicps.protocols import Protocol, EnipProtocol, ModbusProtocol, BACnetProtocol
 
 from nose.tools import eq_
 from nose.plugins.skip import SkipTest
@@ -479,4 +480,139 @@ class TestModbusProtocol():
             ModbusProtocol._stop_server(server)
             print 'ERROR test_client_server_count: ', error
             assert False
+# }}}
+
+
+# TestBACnetProtocol {{{1
+class TestBACnetProtocol():
+
+    # NOTE: second tuple element is the process id
+    TAGS = ({"type": "analogOutput",
+             "index": 1,
+             "name": "analogOutput",
+             "description": ""},
+            {"type": "analogValue",
+             "index": 2,
+             "name": "analogValue",
+             "description": ""},
+            {"type": "binaryOutput",
+             "index": 3,
+             "name": "binaryOutput",
+             "description": ""},
+            )
+    SERVER = {
+        'address': None,
+        'name': "Test BACnet Device",
+        'device_id': 500,
+        'tags': TAGS
+    }
+
+    PROTOCOL = {"name": "bacnet",
+                "mode": 1,
+                "server": SERVER}
+
+    _address_template = '127.0.0.{}:{}'
+
+    # We need to use a new IP on the loopback for every
+    # server we create as the ports don't get freed soon enough
+    # to start the next one.
+    _server_count = 0
+    _current_port = int(BACnetProtocol._UDP_PORT)
+
+    @classmethod
+    def _get_next_protocol(cls, new_port=False):
+        """new_port - increment the port instead of the IP """
+
+        if new_port:
+            cls._current_port += 1
+        else:
+            cls._current_port = int(BACnetProtocol._UDP_PORT)
+            cls._server_count += 1
+
+        protocol = deepcopy(cls.PROTOCOL)
+        protocol["server"]["address"] = cls._address_template.format(cls._server_count,
+                                                                     cls._current_port)
+        return protocol
+
+    def test_server_start_stop(self):
+        try:
+            protocol = self._get_next_protocol()
+            server = BACnetProtocol(protocol)
+            server._stop_server()
+            del server
+
+        except Exception as error:
+            print 'ERROR test_server_start_stop: ', repr(error)
+            assert False
+
+    def test_server_read_self(self):
+        try:
+            protocol = self._get_next_protocol()
+            server = BACnetProtocol(protocol)
+            what = {"type": "analogOutput",
+                    "instance": 1,
+                    "property": "presentValue"}
+            result = server._receive(what=what, address=None)
+            server._stop_server()
+
+            del server
+
+        except Exception as error:
+            print 'ERROR test_server_read_self: ', repr(error)
+            assert False
+
+        assert result == 0
+
+    def test_server_write_read_self(self):
+        test_value = 5
+        try:
+            protocol = self._get_next_protocol()
+            server = BACnetProtocol(protocol)
+            what = {"type": "analogOutput",
+                    "instance": 1,
+                    "property": "presentValue"}
+            server._send(what=what, value=test_value, address=None)
+            result = server._receive(what=what, address=None)
+            server._stop_server()
+
+            del server
+
+        except Exception as error:
+            print 'ERROR test_server_read_self: ', repr(error)
+            assert False
+
+        assert result == test_value
+
+    def test_server_write_read_other(self):
+        # Because of the way BACpypes uses asyncore this test may randomly
+        # raise a OSError: Resource temporarily unavailable
+        # but the test should still pass.
+        test_value = 5.0
+        try:
+            server_protocol = self._get_next_protocol()
+            server_address = server_protocol["server"]["address"]
+            server = BACnetProtocol(server_protocol)
+            client_protocol = self._get_next_protocol()
+            client = BACnetProtocol(client_protocol)
+            client_address = client_protocol["server"]["address"]
+
+            what = {"type": "analogOutput",
+                    "instance": 1,
+                    "property": "presentValue"}
+            client._send(what=what, value=test_value, address=server_address)
+            result = client._receive(what=what, address=server_address)
+            server._stop_server()
+            # Calling stop server on any instance of the protocol kills
+            # All instances of the BACnet device because of the way BACpypes works.
+            # client._stop_server()
+
+            del server
+            del client
+
+        except Exception as error:
+            print 'ERROR test_server_read_self: ', repr(error)
+            raise
+
+        assert result == test_value
+
 # }}}
